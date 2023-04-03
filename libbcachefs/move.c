@@ -620,7 +620,45 @@ int bch2_move_data(struct bch_fs *c,
 	return ret;
 }
 
-void bch2_verify_bucket_evacuated(struct btree_trans *trans, struct bpos bucket, int gen)
+bool bch2_bucket_evacuated(struct btree_trans *trans, struct bpos bucket, int gen)
+{
+	struct bch_fs *c = trans->c;
+	struct btree_iter iter;
+	struct bkey_s_c k;
+	bool evacuated;
+	int ret;
+
+	bch2_trans_begin(trans);
+
+	bch2_trans_iter_init(trans, &iter, BTREE_ID_alloc,
+			     bucket, BTREE_ITER_CACHED);
+again:
+	evacuated = true;
+
+	if (test_bit(BCH_FS_EMERGENCY_RO, &c->flags))
+		goto out;
+
+	ret = lockrestart_do(trans,
+			bkey_err(k = bch2_btree_iter_peek_slot(&iter)));
+
+	if (!ret && k.k->type == KEY_TYPE_alloc_v4) {
+		struct bkey_s_c_alloc_v4 a = bkey_s_c_to_alloc_v4(k);
+
+		if (a.v->gen == gen && a.v->dirty_sectors)
+			evacuated = false;
+
+		if (!evacuated &&
+		    a.v->data_type == BCH_DATA_btree &&
+		    bch2_btree_interior_updates_flush_bucket(trans, bucket))
+			goto again;
+	}
+out:
+	set_btree_iter_dontneed(&iter);
+	bch2_trans_iter_exit(trans, &iter);
+	return evacuated;
+}
+
+bool bch2_verify_bucket_evacuated(struct btree_trans *trans, struct bpos bucket, int gen)
 {
 	struct bch_fs *c = trans->c;
 	struct btree_iter iter;
@@ -631,39 +669,20 @@ void bch2_verify_bucket_evacuated(struct btree_trans *trans, struct bpos bucket,
 	unsigned nr_bps = 0;
 	int ret;
 
-	bch2_trans_begin(trans);
+	if (bch2_bucket_evacuated(trans, bucket, gen))
+		return true;
+
+	prt_printf(&buf, bch2_log_msg(c, "failed to evacuate bucket "));
 
 	bch2_trans_iter_init(trans, &iter, BTREE_ID_alloc,
 			     bucket, BTREE_ITER_CACHED);
-again:
 	ret = lockrestart_do(trans,
 			bkey_err(k = bch2_btree_iter_peek_slot(&iter)));
-
-	if (!ret && k.k->type == KEY_TYPE_alloc_v4) {
-		struct bkey_s_c_alloc_v4 a = bkey_s_c_to_alloc_v4(k);
-
-		if (a.v->gen == gen &&
-		    a.v->dirty_sectors) {
-			if (a.v->data_type == BCH_DATA_btree) {
-				bch2_trans_unlock(trans);
-				if (bch2_btree_interior_updates_flush(c))
-					goto again;
-				goto failed_to_evacuate;
-			}
-		}
-	}
-
-	set_btree_iter_dontneed(&iter);
+	if (!ret)
+		bch2_bkey_val_to_text(&buf, c, k);
 	bch2_trans_iter_exit(trans, &iter);
-	return;
-failed_to_evacuate:
-	bch2_trans_iter_exit(trans, &iter);
-
-	if (test_bit(BCH_FS_EMERGENCY_RO, &c->flags))
-		return;
-
-	prt_printf(&buf, bch2_log_msg(c, "failed to evacuate bucket "));
-	bch2_bkey_val_to_text(&buf, c, k);
+	if (ret)
+		goto out;
 
 	while (1) {
 		bch2_trans_begin(trans);
@@ -696,7 +715,9 @@ failed_to_evacuate:
 	}
 
 	bch2_print_string_as_lines(KERN_ERR, buf.buf);
+out:
 	printbuf_exit(&buf);
+	return false;
 }
 
 int __bch2_evacuate_bucket(struct btree_trans *trans,

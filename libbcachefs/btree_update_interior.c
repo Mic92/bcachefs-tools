@@ -998,6 +998,12 @@ static void bch2_btree_interior_update_will_free_node(struct btree_update *as,
 	bch2_journal_pin_copy(&c->journal, &as->journal, &w->journal, NULL);
 	bch2_journal_pin_drop(&c->journal, &w->journal);
 
+	btree_update_add_key(as, &as->old_keys, b);
+
+	as->old_nodes[as->nr_old_nodes] = b;
+	as->old_nodes_seq[as->nr_old_nodes] = b->data->keys.seq;
+	as->nr_old_nodes++;
+
 	mutex_unlock(&c->btree_interior_update_lock);
 
 	/*
@@ -1010,12 +1016,6 @@ static void bch2_btree_interior_update_will_free_node(struct btree_update *as,
 	 * reachable, prior to freeing it:
 	 */
 	btree_update_drop_new_node(c, b);
-
-	btree_update_add_key(as, &as->old_keys, b);
-
-	as->old_nodes[as->nr_old_nodes] = b;
-	as->old_nodes_seq[as->nr_old_nodes] = b->data->keys.seq;
-	as->nr_old_nodes++;
 }
 
 static void bch2_btree_update_done(struct btree_update *as, struct btree_trans *trans)
@@ -2410,6 +2410,47 @@ bool bch2_btree_interior_updates_flush(struct bch_fs *c)
 	if (ret)
 		closure_wait_event(&c->btree_interior_update_wait,
 				   !bch2_btree_interior_updates_pending(c));
+	return ret;
+}
+
+static bool bch2_btree_interior_updates_pending_for_bucket(struct bch_fs *c,
+							   struct bpos bucket)
+{
+	struct btree_update *as;
+	bool ret = false;
+
+	mutex_lock(&c->btree_interior_update_lock);
+	list_for_each_entry(as, &c->btree_interior_update_list, list) {
+		for (unsigned i = 0; i < as->nr_old_nodes; i++) {
+			struct btree *b = as->old_nodes[i];
+			struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(bkey_i_to_s_c(&b->key));
+			const struct bch_extent_ptr *ptr;
+
+			bkey_for_each_ptr(ptrs, ptr) {
+				if (bkey_eq(PTR_BUCKET_POS(c, ptr), bucket)) {
+					ret = true;
+					goto found;
+				}
+			}
+		}
+	}
+found:
+	mutex_unlock(&c->btree_interior_update_lock);
+
+	return ret;
+}
+
+bool bch2_btree_interior_updates_flush_bucket(struct btree_trans *trans, struct bpos bucket)
+{
+	struct bch_fs *c = trans->c;
+	bool ret = bch2_btree_interior_updates_pending_for_bucket(c, bucket);
+
+	if (ret) {
+		bch2_trans_unlock(trans);
+		closure_wait_event(&c->btree_interior_update_wait,
+			!bch2_btree_interior_updates_pending_for_bucket(c, bucket));
+	}
+
 	return ret;
 }
 

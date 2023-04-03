@@ -313,6 +313,7 @@ static inline bool bch2_btree_node_insert_fits(struct bch_fs *c,
 void bch2_btree_updates_to_text(struct printbuf *, struct bch_fs *);
 
 bool bch2_btree_interior_updates_flush(struct bch_fs *);
+bool bch2_btree_interior_updates_flush_bucket(struct btree_trans *, struct bpos);
 
 void bch2_journal_entry_to_btree_root(struct bch_fs *, struct jset_entry *);
 struct jset_entry *bch2_btree_roots_to_journal_entries(struct bch_fs *,

@@ -31,6 +31,8 @@ struct move_bucket_in_flight {
 	struct rhash_head	hash;
 	struct move_bucket	bucket;
 	atomic_t		count;
+	bool			completed;
+	bool			failed_to_evacuate;
 };
 
 #endif /* _BCACHEFS_MOVE_TYPES_H */

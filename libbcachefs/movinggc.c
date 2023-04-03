@@ -124,29 +124,40 @@ static void move_buckets_wait(struct btree_trans *trans,
 			      struct buckets_in_flight *list,
 			      bool flush)
 {
-	struct move_bucket_in_flight *i;
+	struct move_bucket_in_flight *i, *next;
 	int ret;
 
-	while ((i = list->first)) {
-		if (flush)
-			move_ctxt_wait_event(ctxt, trans, !atomic_read(&i->count));
-
-		if (atomic_read(&i->count))
-			break;
+	for (i = list->first; i; i = next) {
+		next = i->next;
 
 		/*
 		 * moving_ctxt_exit calls bch2_write as it flushes pending
 		 * reads, which inits another btree_trans; this one must be
 		 * unlocked:
 		 */
-		bch2_verify_bucket_evacuated(trans, i->bucket.k.bucket, i->bucket.k.gen);
+		if (flush) {
+			bch2_trans_unlock(trans);
+			move_ctxt_wait_event(ctxt, trans, !atomic_read(&i->count));
+		}
+
+		if (atomic_read(&i->count))
+			break;
+
+		if (!i->completed) {
+			list->nr--;
+			list->sectors -= i->bucket.sectors;
+			i->completed = true;
+		}
+
+		i->failed_to_evacuate = i->failed_to_evacuate
+			? !bch2_verify_bucket_evacuated(trans, i->bucket.k.bucket, i->bucket.k.gen)
+			: !bch2_bucket_evacuated(trans, i->bucket.k.bucket, i->bucket.k.gen);
+		if (i->failed_to_evacuate && !flush)
+			continue;
 
 		list->first = i->next;
 		if (!list->first)
 			list->last = NULL;
-
-		list->nr--;
-		list->sectors -= i->bucket.sectors;
 
 		ret = rhashtable_remove_fast(&list->table, &i->hash,
 					     bch_move_bucket_params);
